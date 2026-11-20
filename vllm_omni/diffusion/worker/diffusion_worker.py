@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
@@ -46,6 +47,8 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.vae_ipc import export_npu_tensor
+from vllm_omni.diffusion.worker.vae_worker import encode_vae_task
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -290,7 +293,7 @@ class DiffusionWorker:
         )
         if vae_disaggregation_enabled and getattr(self, "rank", 0) == 0:
             for new_req in scheduler_output.scheduled_new_reqs:
-                logger.info("DENOISE_BEGIN req_id=%s", new_req.sched_req_id)
+                logger.info("DENOISE_BEGIN req_id=%s ts_ns=%d", new_req.sched_req_id, time.monotonic_ns())
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
@@ -302,13 +305,24 @@ class DiffusionWorker:
                     continue
                 task = getattr(req_output, "vae_task", None)
                 if getattr(self, "rank", 0) == 0:
-                    if task is None:
-                        raise RuntimeError(f"Missing VAE decode task for request {req_output.req_id}.")
-                    if self.vae_task_queue is None:
-                        raise RuntimeError("VAE task queue is not initialized on reply rank 0.")
-                    logger.info("DENOISE_END req_id=%s", req_output.req_id)
-                    self.vae_task_queue.put(task)
-                    logger.info("VAE_SUBMIT req_id=%s", req_output.req_id)
+                    try:
+                        if task is None:
+                            raise RuntimeError(f"Missing VAE decode task for request {req_output.req_id}.")
+                        if self.vae_task_queue is None:
+                            raise RuntimeError("VAE task queue is not initialized on reply rank 0.")
+                        message = task
+                        if task.latents is not None and task.latents.device.type == "npu":
+                            task.latent_ipc = export_npu_tensor(task.latents)
+                            task.latents = None
+                            message = encode_vae_task(task)
+                        logger.info("DENOISE_END req_id=%s ts_ns=%d", req_output.req_id, time.monotonic_ns())
+                        self.vae_task_queue.put(message)
+                        logger.info("VAE_SUBMIT req_id=%s ts_ns=%d", req_output.req_id, time.monotonic_ns())
+                    except Exception as exc:
+                        logger.exception("VAE submission failed for req_id=%s", req_output.req_id)
+                        req_output.denoise_completed = False
+                        req_output.finished = True
+                        req_output.result = DiffusionOutput(error=f"VAE submission failed: {exc}")
                 # Never let the latent-bearing task cross Worker -> Engine IPC.
                 req_output.vae_task = None
         if profiler:

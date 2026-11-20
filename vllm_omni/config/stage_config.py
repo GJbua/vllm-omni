@@ -1188,6 +1188,9 @@ class StageConfigFactory:
             num_devices = kwargs["parallel_config"].world_size
             for i in range(1, num_devices):
                 devices += f",{i}"
+        if kwargs.get("enable_vae_disaggregation", False) is True:
+            num_devices = max(len(devices.split(",")), int(kwargs.get("vae_device", 0)) + 1)
+            devices = ",".join(str(i) for i in range(num_devices))
 
         engine_args: dict[str, Any] = {}
         for key, value in kwargs.items():

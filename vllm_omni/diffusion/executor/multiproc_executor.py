@@ -20,6 +20,7 @@ from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker import WorkerProc
 from vllm_omni.diffusion.worker.vae_worker import VAEDecodeResult, VAEWorkerProc
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -43,12 +44,27 @@ class BackgroundResources:
     wake_events: list[mp.Event] | None = None
     vae_task_queue: mp.Queue | None = None
     vae_result_queue: mp.Queue | None = None
+    vae_process: mp.Process | None = None
 
     def __call__(self):
         """Clean up background resources."""
         if self.wake_events:
             for ev in self.wake_events:
                 ev.set()
+
+        # IPC storage belongs to DiT processes. Stop/drain the consumer before
+        # allowing producers to exit and destroy their device allocations.
+        if self.vae_task_queue is not None:
+            try:
+                self.vae_task_queue.put(None)
+            except Exception as exc:
+                logger.warning("Failed to send VAE shutdown sentinel: %s", exc)
+        if self.vae_process is not None and self.vae_process.is_alive():
+            self.vae_process.join(30)
+            if self.vae_process.is_alive():
+                logger.warning("Terminating VAE worker after drain timeout")
+                self.vae_process.terminate()
+                self.vae_process.join(30)
 
         if self.broadcast_mq is not None:
             try:
@@ -59,12 +75,6 @@ class BackgroundResources:
                 self.result_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
-
-        if self.vae_task_queue is not None:
-            try:
-                self.vae_task_queue.put(None)
-            except Exception as exc:
-                logger.warning("Failed to send VAE shutdown sentinel: %s", exc)
 
         if self.processes:
             for proc in self.processes:
@@ -133,6 +143,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 wake_events=self.wake_events,
                 vae_task_queue=self._vae_task_queue,
                 vae_result_queue=self._vae_result_queue,
+                vae_process=self._vae_process,
             )()
             raise
 
@@ -144,6 +155,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             wake_events=self.wake_events,
             vae_task_queue=self._vae_task_queue,
             vae_result_queue=self._vae_result_queue,
+            vae_process=self._vae_process,
         )
         self._finalizer = weakref.finalize(self, self.resources)
 
@@ -167,6 +179,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise ValueError("VAE disaggregation MVP currently requires pipeline_parallel_size=1.")
         if parallel_config.vae_patch_parallel_size != 1:
             raise ValueError("Standalone VAE worker requires vae_patch_parallel_size=1.")
+        num_dit_workers = self.od_config.num_gpus
+        if num_dit_workers != parallel_config.world_size:
+            raise ValueError("VAE disaggregation requires num_gpus to equal the DiT parallel_config.world_size.")
+        vae_device = self.od_config.vae_device
+        if isinstance(vae_device, bool) or not isinstance(vae_device, int) or vae_device < 0:
+            raise ValueError("vae_device must be a non-negative local device index.")
+        if vae_device < num_dit_workers:
+            raise ValueError(f"vae_device={vae_device} overlaps DiT devices {list(range(num_dit_workers))}.")
+        visible_count = current_omni_platform.get_device_count()
+        if max(num_dit_workers - 1, vae_device) >= visible_count:
+            raise ValueError(
+                f"DiT uses {num_dit_workers} device(s), vae_device={vae_device}, but only {visible_count} are visible. "
+                "Include the VAE device in stage runtime.devices and the platform visibility environment."
+            )
+        logger.info("VAE_DEVICE_MAP dit_local_devices=%s vae_local_device=%d", list(range(num_dit_workers)), vae_device)
 
     def _launch_vae_worker(self) -> mp.Process:
         ready_reader, ready_writer = mp.Pipe(duplex=False)
@@ -189,6 +216,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
         ready_writer.close()
         if not ready_reader.poll(300):
+            ready_reader.close()
             process.terminate()
             process.join(30)
             raise TimeoutError("VAE worker initialization timed out after 300 seconds.")
@@ -302,6 +330,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         try:
             for i, reader in enumerate(scheduler_pipe_readers):
                 try:
+                    if self.vae_disaggregation_enabled and not reader.poll(300):
+                        raise TimeoutError(f"DiT rank {i} initialization timed out after 300 seconds.")
                     data = reader.recv()
                 except EOFError:
                     logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")

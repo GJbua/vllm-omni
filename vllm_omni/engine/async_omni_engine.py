@@ -1437,6 +1437,8 @@ class AsyncOmniEngine:
             )
 
         num_devices = max(1, int(parallel_config.world_size))
+        if kwargs.get("enable_vae_disaggregation", False) is True:
+            num_devices = max(num_devices, int(kwargs.get("vae_device", 0)) + 1)
         devices = ",".join(str(i) for i in range(num_devices))
         model_class_name = kwargs.get("model_class_name", None)
         final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"

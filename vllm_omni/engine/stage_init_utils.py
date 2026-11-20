@@ -820,6 +820,9 @@ def acquire_diffusion_device_locks(
     except (TypeError, ValueError):
         world_size = 1
 
+    if getattr(od_config, "enable_vae_disaggregation", False) is True:
+        world_size = max(world_size, int(od_config.vae_device) + 1)
+
     return acquire_device_locks(
         stage_id,
         {"tensor_parallel_size": world_size},

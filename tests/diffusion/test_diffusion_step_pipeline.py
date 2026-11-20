@@ -3,6 +3,7 @@
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import contextlib
+import json
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.worker.vae_worker as vae_worker_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -25,7 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.executor.multiproc_executor import BackgroundResources, MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -615,6 +617,25 @@ class TestWorker:
         if submitted:
             assert submitted[0] is task
 
+    def test_vae_submission_error_is_request_local(self):
+        worker = object.__new__(DiffusionWorker)
+        worker.od_config = SimpleNamespace(enable_vae_disaggregation=True)
+        worker.rank = 0
+        worker.lora_manager = None
+        worker.vae_task_queue = SimpleNamespace(put=lambda _: (_ for _ in ()).throw(RuntimeError("queue closed")))
+        output = RunnerOutput(
+            req_id="req-vae",
+            step_index=1,
+            denoise_completed=True,
+            vae_task=VAEDecodeTask(req_id="req-vae", latents=torch.zeros(1, 4, 4), height=64, width=64),
+        )
+        worker.model_runner = SimpleNamespace(execute_stepwise=lambda _: output)
+        result = worker.execute_stepwise(SimpleNamespace(scheduled_new_reqs=[]))
+        assert result.finished is True
+        assert result.denoise_completed is False
+        assert result.vae_task is None
+        assert "queue closed" in result.result.error
+
 
 @pytest.mark.cpu
 class TestExecutor:
@@ -633,6 +654,23 @@ class TestExecutor:
 
         assert output is expected
 
+    def test_shutdown_stops_vae_before_dit_ipc_owner(self, mocker: MockerFixture):
+        events = []
+        vae = mocker.Mock()
+        vae.is_alive.side_effect = [True, False, False]
+        vae.join.side_effect = lambda _: events.append("vae_stopped")
+        broadcast = mocker.Mock()
+        broadcast.enqueue.side_effect = lambda *args, **kwargs: events.append("dit_shutdown")
+        resources = BackgroundResources(
+            broadcast_mq=broadcast,
+            num_workers=1,
+            processes=[vae],
+            vae_task_queue=mocker.Mock(),
+            vae_process=vae,
+        )
+        resources()
+        assert events == ["vae_stopped", "dit_shutdown"]
+
     def test_disaggregation_rejects_multiple_dp_replicas(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor.od_config = SimpleNamespace(
@@ -648,9 +686,51 @@ class TestExecutor:
         with pytest.raises(ValueError, match="data_parallel_size=1"):
             executor._validate_vae_disaggregation_config()
 
+    @pytest.mark.parametrize(
+        ("dit_count", "vae_device", "visible_count", "error"),
+        [(1, 0, 2, "overlaps"), (1, 2, 2, "visible"), (1, -1, 2, "non-negative"), (1, 1, 2, None)],
+    )
+    def test_disaggregation_device_mapping(self, monkeypatch, dit_count, vae_device, visible_count, error):
+        monkeypatch.setattr(current_omni_platform, "get_device_count", lambda: visible_count)
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(
+            step_execution=True,
+            model_class_name="QwenImagePipeline",
+            num_gpus=dit_count,
+            vae_device=vae_device,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1, pipeline_parallel_size=1, vae_patch_parallel_size=1, world_size=dit_count
+            ),
+        )
+        if error:
+            with pytest.raises(ValueError, match=error):
+                executor._validate_vae_disaggregation_config()
+        else:
+            executor._validate_vae_disaggregation_config()
+
 
 @pytest.mark.cpu
 class TestVAEWorker:
+    def test_bad_ipc_metadata_does_not_poison_next_request(self, mocker: MockerFixture):
+        worker = object.__new__(VAEWorkerProc)
+        worker.task_queue = queue.Queue()
+        worker.result_queue = queue.Queue()
+        task = VAEDecodeTask(req_id="good", latents=torch.zeros(1, 4, 4), height=64, width=64)
+        mocker.patch.object(
+            vae_worker_module, "decode_vae_task", side_effect=[RuntimeError("signature mismatch"), task]
+        )
+        mocker.patch.object(current_omni_platform, "synchronize")
+        worker.decode = lambda _: DiffusionOutput(output=torch.zeros(1))
+        worker.task_queue.put(json.dumps({"req_id": "bad"}))
+        worker.task_queue.put(json.dumps({"req_id": "good"}))
+        worker.task_queue.put(None)
+        worker.busy_loop()
+        failed = worker.result_queue.get_nowait()
+        assert failed.req_id == "bad" and "signature mismatch" in failed.error
+        succeeded = worker.result_queue.get_nowait()
+        assert succeeded.req_id == "good" and succeeded.error is None
+        assert succeeded.result.output.device.type == "cpu"
+
     def test_decode_error_is_returned_with_request_id(self):
         worker = object.__new__(VAEWorkerProc)
         worker.task_queue = queue.Queue()
@@ -839,6 +919,13 @@ class TestSupportedPipelines:
         assert stage_cfg["engine_args"]["step_execution"] is True
         assert stage_cfg["engine_args"]["enable_vae_disaggregation"] is True
         assert stage_cfg["engine_args"]["vae_device"] == 2
+        assert stage_cfg["runtime"]["devices"] == "0,1,2"
+
+    def test_stage_config_factory_keeps_vae_device_visible(self):
+        from vllm_omni.config.stage_config import StageConfigFactory
+
+        stage_cfg = StageConfigFactory.create_default_diffusion({"enable_vae_disaggregation": True, "vae_device": 1})[0]
+        assert stage_cfg["runtime"]["devices"] == "0,1"
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
