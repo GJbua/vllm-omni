@@ -290,9 +290,23 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         ).to(self.device)
-        self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
-            model, subfolder="vae", local_files_only=local_files_only
-        ).to(self.device)
+        if getattr(od_config, "enable_vae_disaggregation", False) is True:
+            # The standalone VAE process owns these weights.  Keep the DiT
+            # pipeline free of a duplicate VAE allocation.
+            self.vae = None
+            vae_config = DistributedAutoencoderKLQwenImage.load_config(
+                model,
+                subfolder="vae",
+                local_files_only=local_files_only,
+            )
+            temporal_downsample = vae_config.get("temporal_downsample")
+            if temporal_downsample is None:
+                temporal_downsample = vae_config.get("temperal_downsample")
+            self.vae_scale_factor = 2 ** len(temporal_downsample) if temporal_downsample is not None else 8
+        else:
+            self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
+                model, subfolder="vae", local_files_only=local_files_only
+            ).to(self.device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
@@ -302,7 +316,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         self.stage = None
 
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        if not hasattr(self, "vae_scale_factor"):
+            self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this

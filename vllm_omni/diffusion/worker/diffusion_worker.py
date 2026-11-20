@@ -73,6 +73,7 @@ class DiffusionWorker:
         rank: int,
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
+        vae_task_queue: Any = None,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -82,6 +83,7 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        self.vae_task_queue = vae_task_queue
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner
@@ -278,10 +280,37 @@ class DiffusionWorker:
 
         if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
             raise ValueError("Step mode does not support LoRA yet.")
+        vae_disaggregation_enabled = (
+            getattr(
+                getattr(self, "od_config", None),
+                "enable_vae_disaggregation",
+                False,
+            )
+            is True
+        )
+        if vae_disaggregation_enabled and getattr(self, "rank", 0) == 0:
+            for new_req in scheduler_output.scheduled_new_reqs:
+                logger.info("DENOISE_BEGIN req_id=%s", new_req.sched_req_id)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
             output = self.model_runner.execute_stepwise(scheduler_output)
+        if vae_disaggregation_enabled:
+            runner_outputs = getattr(output, "runner_outputs", [output])
+            for req_output in runner_outputs:
+                if not getattr(req_output, "denoise_completed", False):
+                    continue
+                task = getattr(req_output, "vae_task", None)
+                if getattr(self, "rank", 0) == 0:
+                    if task is None:
+                        raise RuntimeError(f"Missing VAE decode task for request {req_output.req_id}.")
+                    if self.vae_task_queue is None:
+                        raise RuntimeError("VAE task queue is not initialized on reply rank 0.")
+                    logger.info("DENOISE_END req_id=%s", req_output.req_id)
+                    self.vae_task_queue.put(task)
+                    logger.info("VAE_SUBMIT req_id=%s", req_output.req_id)
+                # Never let the latent-bearing task cross Worker -> Engine IPC.
+                req_output.vae_task = None
         if profiler:
             profiler.step()
         return output
@@ -527,6 +556,7 @@ class WorkerProc:
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        vae_task_queue: Any = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
@@ -556,7 +586,13 @@ class WorkerProc:
         assert od_config.master_port is not None
 
         # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        self.worker = self._create_worker(
+            gpu_id,
+            od_config,
+            worker_extension_cls,
+            custom_pipeline_args,
+            vae_task_queue,
+        )
         self._running = True
 
     def _create_worker(
@@ -565,6 +601,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         worker_extension_cls: str | None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        vae_task_queue: Any = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
         wrapper = WorkerWrapperBase(
@@ -572,6 +609,7 @@ class WorkerProc:
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            vae_task_queue=vae_task_queue,
         )
         return wrapper
 
@@ -693,6 +731,7 @@ class WorkerProc:
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        vae_task_queue: Any = None,
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
@@ -705,6 +744,7 @@ class WorkerProc:
             wake_event=wake_event,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            vae_task_queue=vae_task_queue,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
@@ -731,6 +771,7 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        vae_task_queue: Any = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
@@ -755,11 +796,16 @@ class WorkerWrapperBase:
         # since re_init_pipeline will handle it. This avoids allocating memory
         # through CuMemAllocator twice, which causes assertion failures in
         # sleep mode.
+        worker_kwargs = {
+            "local_rank": gpu_id,
+            "rank": gpu_id,
+            "od_config": od_config,
+            "skip_load_model": self.custom_pipeline_args is not None,
+        }
+        if getattr(od_config, "enable_vae_disaggregation", False) is True:
+            worker_kwargs["vae_task_queue"] = vae_task_queue
         self.worker = worker_class(
-            local_rank=gpu_id,
-            rank=gpu_id,
-            od_config=od_config,
-            skip_load_model=(self.custom_pipeline_args is not None),
+            **worker_kwargs,
         )
 
         # Re-initialize pipeline with custom pipeline if provided

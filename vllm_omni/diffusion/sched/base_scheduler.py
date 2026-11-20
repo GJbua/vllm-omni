@@ -44,6 +44,7 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
+        self._decoding: set[str] = set()
         self._running_sampling_params_key: SamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
@@ -55,6 +56,7 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id = 0
         self._waiting.clear()
         self._running.clear()
+        self._decoding.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
@@ -132,6 +134,8 @@ class _BaseScheduler(SchedulerInterface):
 
     def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         self._pop_extra_request_state(sched_req_id)
+        self._decoding.discard(sched_req_id)
+        self._finished_req_ids.discard(sched_req_id)
         state = self._request_states.pop(sched_req_id, None)
         if state is not None:
             self._unregister_request_ids(state.req.request_ids, sched_req_id)
@@ -149,6 +153,27 @@ class _BaseScheduler(SchedulerInterface):
             return True
         return False
 
+    def mark_decoding(self, sched_req_id: str) -> bool:
+        state = self._request_states.get(sched_req_id)
+        if state is None:
+            return False
+        if state.status == DiffusionRequestStatus.DECODING:
+            return True
+        if state.status != DiffusionRequestStatus.RUNNING or sched_req_id not in self._running:
+            return False
+
+        self._running.remove(sched_req_id)
+        if not self._running:
+            self._running_sampling_params_key = None
+        state.status = DiffusionRequestStatus.DECODING
+        state.error = None
+        self._decoding.add(sched_req_id)
+        logger.info("REQUEST_DECODING req_id=%s", sched_req_id)
+        return True
+
+    def get_decoding_req_ids(self) -> set[str]:
+        return set(self._decoding)
+
     def finish_requests(self, sched_req_ids: str | list[str], status: DiffusionRequestStatus) -> None:
         assert DiffusionRequestStatus.is_finished(status)
         if isinstance(sched_req_ids, str):
@@ -160,6 +185,7 @@ class _BaseScheduler(SchedulerInterface):
         self._request_id_to_sched_req_id.clear()
         self._waiting.clear()
         self._running.clear()
+        self._decoding.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
@@ -175,6 +201,7 @@ class _BaseScheduler(SchedulerInterface):
         finished_req_ids: set[str] = set()
         running_to_remove: set[str] = set()
         waiting_to_remove: set[str] = set()
+        decoding_to_remove: set[str] = set()
 
         for sched_req_id, status in statuses.items():
             assert DiffusionRequestStatus.is_finished(status)
@@ -187,6 +214,8 @@ class _BaseScheduler(SchedulerInterface):
                 running_to_remove.add(sched_req_id)
             if sched_req_id in self._waiting:
                 waiting_to_remove.add(sched_req_id)
+            if sched_req_id in self._decoding:
+                decoding_to_remove.add(sched_req_id)
 
         if running_to_remove:
             self._running = [sched_req_id for sched_req_id in self._running if sched_req_id not in running_to_remove]
@@ -196,6 +225,7 @@ class _BaseScheduler(SchedulerInterface):
             self._waiting = deque(
                 sched_req_id for sched_req_id in self._waiting if sched_req_id not in waiting_to_remove
             )
+        self._decoding -= decoding_to_remove
 
         for sched_req_id in finished_req_ids:
             state = self._request_states[sched_req_id]

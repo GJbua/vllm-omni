@@ -27,6 +27,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
+    DECODING = enum.auto()
 
     # if any status is after or equal to FINISHED_COMPLETED, it is considered finished
     FINISHED_COMPLETED = enum.auto()
@@ -196,6 +197,14 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def preempt_request(self, sched_req_id: str) -> bool:
         """Preempt a running request back to waiting."""
+
+    def mark_decoding(self, sched_req_id: str) -> bool:
+        """Move a denoise-complete request out of the runnable set."""
+        raise NotImplementedError
+
+    def get_decoding_req_ids(self) -> set[str]:
+        """Return requests waiting for standalone VAE results."""
+        return set()
 
     @abstractmethod
     def finish_requests(self, sched_req_ids: str | list[str], status: DiffusionRequestStatus) -> None:

@@ -106,7 +106,11 @@ class StepScheduler(_BaseScheduler):
             # We assume that the decoding stage is executed immediately after the denoising stage completes.
             progress.current_step = req_output.step_index
             state.req.sampling_params.step_index = req_output.step_index
-            if req_output.finished:
+            if req_output.denoise_completed:
+                if not self.mark_decoding(sched_req_id):
+                    terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                    terminal_errors[sched_req_id] = "Invalid RUNNING to DECODING transition"
+            elif req_output.finished:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[sched_req_id] = None
             else:

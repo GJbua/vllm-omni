@@ -519,6 +519,11 @@ class OmniDiffusionConfig:
 
     # Step mode settings
     step_execution: bool = False
+    # Run final Qwen-Image VAE decode in a standalone process.  This MVP is
+    # intentionally opt-in while model and parallelism coverage is limited.
+    enable_vae_disaggregation: bool = False
+    # Local accelerator index used by the standalone VAE process.
+    vae_device: int = 0
 
     # sleep mode
     enable_sleep_mode: bool = False

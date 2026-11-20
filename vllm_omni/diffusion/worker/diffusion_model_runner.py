@@ -35,6 +35,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.vae_worker import VAEDecodeTask
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -446,15 +447,45 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
                         offset = offset + row_num
                         if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
+                            if getattr(self.od_config, "enable_vae_disaggregation", False) is True:
+                                if req.latents is None:
+                                    raise ValueError(f"Request {req.req_id} completed denoise without latents.")
+                                height = (
+                                    req.sampling.height
+                                    or self.pipeline.default_sample_size * self.pipeline.vae_scale_factor
+                                )
+                                width = (
+                                    req.sampling.width
+                                    or self.pipeline.default_sample_size * self.pipeline.vae_scale_factor
+                                )
+                                vae_task = VAEDecodeTask(
+                                    req_id=req.req_id,
+                                    latents=req.latents.detach(),
+                                    height=height,
+                                    width=width,
+                                    stage_durations=dict(getattr(self.pipeline, "stage_durations", {})),
+                                )
+                                result = None
+                                finished = False
+                                denoise_completed = True
+                            else:
+                                vae_task = None
+                                result = self.pipeline.post_decode(req)
+                                finished = True
+                                denoise_completed = False
                         else:
+                            vae_task = None
                             result = None
+                            finished = False
+                            denoise_completed = False
                         runner_output_list.append(
                             RunnerOutput(
                                 req_id=req.req_id,
                                 step_index=req.step_index,
-                                finished=req.denoise_completed,
+                                finished=finished,
+                                denoise_completed=denoise_completed,
                                 result=result,
+                                vae_task=vae_task,
                             )
                         )
 

@@ -1446,6 +1446,8 @@ class AsyncOmniEngine:
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
             "step_execution": kwargs.get("step_execution", False),
+            "enable_vae_disaggregation": kwargs.get("enable_vae_disaggregation", False),
+            "vae_device": kwargs.get("vae_device", 0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

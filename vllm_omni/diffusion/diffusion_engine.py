@@ -32,6 +32,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.diffusion.worker.vae_worker import VAEDecodeResult
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -113,6 +114,10 @@ class DiffusionEngine:
         self._out_queue: dict[str, asyncio.Future] = {}
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        self.vae_disaggregation_enabled = self.executor.vae_disaggregation_enabled is True
+        self.vae_result_collector_thread: threading.Thread | None = None
+        self._pending_vae_results: dict[str, VAEDecodeResult] = {}
+        self._vae_terminal_error: str | None = None
 
         try:
             self._dummy_run()
@@ -132,7 +137,17 @@ class DiffusionEngine:
 
             self.main_loop = asyncio.get_running_loop()
             self.stop_event = threading.Event()
-            self.worker_thread = threading.Thread(target=self._busy_loop)
+            if getattr(self, "vae_disaggregation_enabled", False):
+                self.vae_result_collector_thread = threading.Thread(
+                    target=self._vae_result_collector_loop,
+                    name="DiffusionVAECollector",
+                    daemon=True,
+                )
+                self.vae_result_collector_thread.start()
+            self.worker_thread = threading.Thread(
+                target=self._busy_loop,
+                name="DiffusionEngineWorker",
+            )
             self.worker_thread.start()
             self._loop_started = True
 
@@ -378,7 +393,8 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
-                self._handle_finished_requests(sched_output.finished_req_ids, None)
+                with self._cv:
+                    self._handle_finished_requests(sched_output.finished_req_ids, None)
                 continue
 
             try:
@@ -400,8 +416,97 @@ class DiffusionEngine:
                 )
 
             self._process_aborts_queue()
-            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._handle_finished_requests(finished_req_ids, runner_output)
+            with self._cv:
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._handle_finished_requests(finished_req_ids, runner_output)
+                self._drain_pending_vae_results(sched_output.scheduled_req_ids)
+                vae_terminal_error = getattr(self, "_vae_terminal_error", None)
+                if vae_terminal_error is not None:
+                    self._fail_decoding_requests(vae_terminal_error)
+
+    def _vae_result_collector_loop(self) -> None:
+        assert self.stop_event is not None
+        # Keep draining until the VAE's sentinel arrives. During shutdown this
+        # prevents packed shared-memory outputs from being abandoned in the
+        # queue after the scheduling thread has stopped.
+        while True:
+            try:
+                result = self.executor.get_vae_result(timeout=1.0)
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                logger.error("VAE result collector failed", exc_info=True)
+                with self._cv:
+                    self._vae_terminal_error = f"VAE result collector failed: {exc}"
+                    self._fail_decoding_requests(self._vae_terminal_error)
+                return
+
+            if result is None:
+                if not self.stop_event.is_set():
+                    with self._cv:
+                        self._vae_terminal_error = "Standalone VAE worker stopped unexpectedly."
+                        self._fail_decoding_requests(self._vae_terminal_error)
+                return
+
+            with self._cv:
+                self._complete_vae_result(result)
+
+    def _complete_vae_result(self, vae_result: VAEDecodeResult) -> None:
+        sched_req_id = vae_result.req_id
+        state = self.scheduler.get_request_state(sched_req_id)
+        if state is None or state.is_finished():
+            logger.warning("Ignoring stale VAE result for request %s", sched_req_id)
+            self._pending_vae_results.pop(sched_req_id, None)
+            return
+
+        # The worker submits to VAE before its RunnerOutput reaches the engine.
+        # Buffer an unusually fast decode until update_from_output marks DECODING.
+        if state.status == DiffusionRequestStatus.RUNNING:
+            self._pending_vae_results[sched_req_id] = vae_result
+            return
+        if state.status != DiffusionRequestStatus.DECODING:
+            logger.warning(
+                "Ignoring VAE result for request %s in status %s",
+                sched_req_id,
+                state.status.name,
+            )
+            return
+
+        self._pending_vae_results.pop(sched_req_id, None)
+        if vae_result.error is not None or vae_result.result is None:
+            error = vae_result.error or "Standalone VAE finished without a result."
+            self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ERROR)
+            runner_output = RunnerOutput(
+                req_id=sched_req_id,
+                step_index=state.req.sampling_params.step_index,
+                finished=True,
+                result=DiffusionOutput(error=error),
+            )
+        else:
+            self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_COMPLETED)
+            runner_output = RunnerOutput(
+                req_id=sched_req_id,
+                step_index=state.req.sampling_params.step_index,
+                finished=True,
+                result=vae_result.result,
+            )
+
+        logger.info("REQUEST_FINISHED req_id=%s status=%s", sched_req_id, state.status.name)
+        self._handle_finished_requests({sched_req_id}, runner_output)
+        self._cv.notify_all()
+
+    def _drain_pending_vae_results(self, sched_req_ids: Iterable[str]) -> None:
+        for sched_req_id in sched_req_ids:
+            result = self._pending_vae_results.get(sched_req_id)
+            state = self.scheduler.get_request_state(sched_req_id)
+            if result is not None and state is not None and state.status == DiffusionRequestStatus.DECODING:
+                self._complete_vae_result(result)
+
+    def _fail_decoding_requests(self, error: str) -> None:
+        for sched_req_id in self.scheduler.get_decoding_req_ids():
+            self._complete_vae_result(VAEDecodeResult(req_id=sched_req_id, error=error))
 
     def _handle_finished_requests(
         self,
@@ -409,15 +514,18 @@ class DiffusionEngine:
         runner_output: RunnerOutput | None = None,
         missing_result_error: str = "Diffusion execution finished without a final output",
     ):
+        out_queue = getattr(self, "_out_queue", {})
         for rid in finished_ids:
-            if rid in self._out_queue:
-                fut = self._out_queue.pop(rid)
+            getattr(self, "_pending_vae_results", {}).pop(rid, None)
+            if rid in out_queue:
+                fut = out_queue[rid]
                 if runner_output is not None:
                     _output = runner_output.get_req_output(rid)
                 else:
                     _output = None
                 out = self._finalize_finished_request(rid, _output, missing_result_error)
                 if not fut.done():
+                    assert self.main_loop is not None
                     self.main_loop.call_soon_threadsafe(fut.set_result, out)
 
     @staticmethod
@@ -445,7 +553,8 @@ class DiffusionEngine:
         return sched_req_id
 
     async def get_result(self, request_id: str) -> DiffusionOutput:
-        fut = self._out_queue.get(request_id)
+        with self._cv:
+            fut = self._out_queue.get(request_id)
 
         if fut is None:
             raise RuntimeError(f"Request {request_id} not found in output queue.")
@@ -454,6 +563,10 @@ class DiffusionEngine:
         except Exception as e:
             logger.error(f"Wait for response failed: {e}")
             raise
+        finally:
+            with self._cv:
+                if self._out_queue.get(request_id) is fut:
+                    self._out_queue.pop(request_id, None)
 
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         sched_req_id = self.add_request(request)
@@ -503,6 +616,31 @@ class DiffusionEngine:
                         target_sched_req_id,
                         runner_output=runner_output,
                         missing_result_error="Diffusion execution finished without a final output.",
+                    )
+                state = self.scheduler.get_request_state(target_sched_req_id)
+                if state is not None and state.status == DiffusionRequestStatus.DECODING:
+                    vae_result = self.executor.get_vae_result()
+                    if vae_result is None:
+                        raise RuntimeError("Standalone VAE worker stopped during dummy run.")
+                    if vae_result.req_id != target_sched_req_id:
+                        raise RuntimeError(
+                            "Dummy run received a VAE result for an unexpected request: "
+                            f"{vae_result.req_id!r}."
+                        )
+                    self._complete_vae_result(vae_result)
+                    completed_output = vae_result.result
+                    if vae_result.error is not None or completed_output is None:
+                        completed_output = DiffusionOutput(
+                            error=vae_result.error or "Standalone VAE finished without a result."
+                        )
+                    return self._finalize_finished_request(
+                        target_sched_req_id,
+                        RunnerOutput(
+                            req_id=target_sched_req_id,
+                            step_index=state.req.sampling_params.step_index,
+                            finished=True,
+                            result=completed_output,
+                        ),
                     )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -619,8 +757,6 @@ class DiffusionEngine:
                 self._rpc_lock.release()
 
     def close(self) -> None:
-        if hasattr(self, "scheduler"):
-            self.scheduler.close()
         if hasattr(self, "stop_event") and self.stop_event is not None:
             with self._cv:
                 self.stop_event.set()
@@ -631,8 +767,20 @@ class DiffusionEngine:
                 logger.warning("Worker thread did not terminate within 10s, resources may not be released.")
             else:
                 self._loop_started = False
-        if hasattr(self, "executor"):
-            self.executor.shutdown()
+        try:
+            if hasattr(self, "executor"):
+                self.executor.shutdown()
+        finally:
+            vae_collector = getattr(self, "vae_result_collector_thread", None)
+            if vae_collector is not None and vae_collector.is_alive():
+                vae_collector.join(timeout=10)
+                if vae_collector.is_alive():
+                    logger.warning("VAE result collector did not terminate within 10s.")
+            if hasattr(self, "_pending_vae_results"):
+                self._pending_vae_results.clear()
+            self._vae_terminal_error = None
+            if hasattr(self, "scheduler"):
+                self.scheduler.close()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
@@ -656,15 +804,20 @@ class DiffusionEngine:
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
 
-        sched_req_ids: list[str] = []
-        for request_id in dict.fromkeys(request_ids):
-            sched_req_id = self.scheduler.get_sched_req_id(request_id)
-            if sched_req_id is not None:
-                sched_req_ids.append(sched_req_id)
+        with self._cv:
+            sched_req_ids: list[str] = []
+            for request_id in dict.fromkeys(request_ids):
+                sched_req_id = self.scheduler.get_sched_req_id(request_id)
+                if sched_req_id is not None:
+                    sched_req_ids.append(sched_req_id)
 
-        for sched_req_id in dict.fromkeys(sched_req_ids):
-            if self.scheduler.get_request_state(sched_req_id) is not None:
-                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+            aborted: set[str] = set()
+            for sched_req_id in dict.fromkeys(sched_req_ids):
+                if self.scheduler.get_request_state(sched_req_id) is not None:
+                    self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+                    getattr(self, "_pending_vae_results", {}).pop(sched_req_id, None)
+                    aborted.add(sched_req_id)
+            self._handle_finished_requests(aborted, None)
 
     def _finalize_finished_request(
         self,

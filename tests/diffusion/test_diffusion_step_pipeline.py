@@ -40,6 +40,11 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.vae_worker import (
+    VAEDecodeResult,
+    VAEDecodeTask,
+    VAEWorkerProc,
+)
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -66,12 +71,15 @@ class _StepPipeline:
     """Minimal pipeline stub that supports step-wise execution."""
 
     supports_step_execution = True
+    default_sample_size = 8
+    vae_scale_factor = 8
 
     def __init__(self):
         self.prepare_calls = 0
         self.denoise_calls = 0
         self.scheduler_calls = 0
         self.decode_calls = 0
+        self.stage_durations = {}
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
@@ -392,6 +400,27 @@ class TestRunner:
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
 
+    def test_disaggregation_returns_task_without_inline_decode(self, monkeypatch):
+        runner = _make_runner()
+        runner.od_config.enable_vae_disaggregation = True
+        req = _make_step_request(num_inference_steps=1)
+        req.sampling_params.height = 64
+        req.sampling_params.width = 96
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        output = result.get_req_output("req-1")
+
+        assert output.finished is False
+        assert output.denoise_completed is True
+        assert output.result is None
+        assert output.vae_task is not None
+        assert output.vae_task.req_id == "req-1"
+        assert output.vae_task.height == 64
+        assert output.vae_task.width == 96
+        assert runner.pipeline.decode_calls == 0
+        assert "req-1" not in runner.state_cache
+
     def test_rejects_multi_request_step_batch(self):
         runner = _make_runner()
         req_1 = _make_step_request()
@@ -554,6 +583,38 @@ class TestWorker:
         with pytest.raises(ValueError, match="does not support LoRA"):
             DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
+    @pytest.mark.parametrize(("rank", "expected_submissions"), [(0, 1), (1, 0)])
+    def test_only_reply_rank_submits_vae_task(self, rank, expected_submissions):
+        worker = object.__new__(DiffusionWorker)
+        worker.od_config = SimpleNamespace(enable_vae_disaggregation=True)
+        worker.rank = rank
+        worker.lora_manager = None
+        worker.vae_task_queue = queue.Queue()
+        task = VAEDecodeTask(
+            req_id="req-vae",
+            latents=torch.zeros(1, 4, 4),
+            height=64,
+            width=64,
+        )
+        runner_output = RunnerOutput(
+            req_id="req-vae",
+            step_index=1,
+            denoise_completed=True,
+            vae_task=task,
+        )
+        worker.model_runner = SimpleNamespace(execute_stepwise=lambda _: runner_output)
+        scheduler_output = SimpleNamespace(scheduled_new_reqs=[])
+
+        output = DiffusionWorker.execute_stepwise(worker, scheduler_output)
+
+        assert output.vae_task is None
+        submitted = []
+        while not worker.vae_task_queue.empty():
+            submitted.append(worker.vae_task_queue.get_nowait())
+        assert len(submitted) == expected_submissions
+        if submitted:
+            assert submitted[0] is task
+
 
 @pytest.mark.cpu
 class TestExecutor:
@@ -571,6 +632,51 @@ class TestExecutor:
         output = MultiprocDiffusionExecutor.execute_step(executor, scheduler_output)
 
         assert output is expected
+
+    def test_disaggregation_rejects_multiple_dp_replicas(self):
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(
+            step_execution=True,
+            model_class_name="QwenImagePipeline",
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                pipeline_parallel_size=1,
+                vae_patch_parallel_size=1,
+            ),
+        )
+
+        with pytest.raises(ValueError, match="data_parallel_size=1"):
+            executor._validate_vae_disaggregation_config()
+
+
+@pytest.mark.cpu
+class TestVAEWorker:
+    def test_decode_error_is_returned_with_request_id(self):
+        worker = object.__new__(VAEWorkerProc)
+        worker.task_queue = queue.Queue()
+        worker.result_queue = queue.Queue()
+
+        def fail_decode(_):
+            raise RuntimeError("bad latent")
+
+        worker.decode = fail_decode
+        worker.task_queue.put(
+            VAEDecodeTask(
+                req_id="req-bad",
+                latents=torch.zeros(1, 4, 4),
+                height=64,
+                width=64,
+            )
+        )
+        worker.task_queue.put(None)
+
+        worker.busy_loop()
+
+        result = worker.result_queue.get_nowait()
+        assert isinstance(result, VAEDecodeResult)
+        assert result.req_id == "req-bad"
+        assert result.result is None
+        assert result.error == "bad latent"
 
 
 @pytest.mark.cpu
@@ -725,10 +831,14 @@ class TestSupportedPipelines:
         stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
             {
                 "step_execution": True,
+                "enable_vae_disaggregation": True,
+                "vae_device": 2,
             }
         )[0]
 
         assert stage_cfg["engine_args"]["step_execution"] is True
+        assert stage_cfg["engine_args"]["enable_vae_disaggregation"] is True
+        assert stage_cfg["engine_args"]["vae_device"] == 2
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution

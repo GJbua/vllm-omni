@@ -101,6 +101,15 @@ class DiffusionExecutor(ABC):
         """Check if the executor and workers are healthy."""
         pass
 
+    @property
+    def vae_disaggregation_enabled(self) -> bool:
+        """Whether this executor exposes a standalone VAE result channel."""
+        return False
+
+    def get_vae_result(self, timeout: float | None = None) -> Any:
+        """Receive one standalone VAE result without involving the scheduler."""
+        raise NotImplementedError("This executor does not support VAE disaggregation.")
+
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the executor and release resources."""

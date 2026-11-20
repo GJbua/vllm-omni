@@ -12,6 +12,7 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.vae_worker import VAEDecodeTask
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -128,7 +129,11 @@ class RunnerOutput(BaseRunnerOutput):
     req_id: str
     step_index: int | None = None
     finished: bool = False
+    denoise_completed: bool = False
     result: DiffusionOutput | None = None
+    # Worker-local data-plane payload. DiffusionWorker submits it directly to
+    # the VAE process and clears it before RunnerOutput crosses to the engine.
+    vae_task: VAEDecodeTask | None = None
 
     def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
         return self if self.req_id == sched_req_id else None

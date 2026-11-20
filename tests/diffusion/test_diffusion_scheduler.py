@@ -22,6 +22,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.vae_worker import VAEDecodeResult
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -433,6 +434,73 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
+    @pytest.mark.asyncio
+    async def test_early_vae_result_finishes_future_after_decoding_transition(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._pending_vae_results = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_step_request("vae", num_inference_steps=1))
+        sched_output = engine.scheduler.schedule()
+        future = engine.main_loop.create_future()
+        engine._out_queue = {req_id: future}
+        expected = DiffusionOutput(output=torch.tensor([7.0]))
+
+        # The data-plane result may win the race against the metadata result.
+        with engine._cv:
+            engine._complete_vae_result(VAEDecodeResult(req_id=req_id, result=expected))
+        assert req_id in engine._pending_vae_results
+        assert future.done() is False
+
+        with engine._cv:
+            finished = engine.scheduler.update_from_output(
+                sched_output,
+                RunnerOutput(
+                    req_id=req_id,
+                    step_index=1,
+                    denoise_completed=True,
+                ),
+            )
+            engine._drain_pending_vae_results([req_id])
+
+        assert finished == set()
+        output = await asyncio.wait_for(engine.get_result(req_id), timeout=1.0)
+        assert output is expected
+        assert engine.scheduler.get_request_state(req_id) is None
+        assert req_id not in engine._pending_vae_results
+        assert req_id not in engine._out_queue
+
+    @pytest.mark.asyncio
+    async def test_vae_error_finishes_future(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._pending_vae_results = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_step_request("vae-error", num_inference_steps=1))
+        sched_output = engine.scheduler.schedule()
+        engine.scheduler.update_from_output(
+            sched_output,
+            RunnerOutput(req_id=req_id, step_index=1, denoise_completed=True),
+        )
+        future = engine.main_loop.create_future()
+        engine._out_queue = {req_id: future}
+
+        with engine._cv:
+            engine._complete_vae_result(VAEDecodeResult(req_id=req_id, error="decode failed"))
+
+        output = await asyncio.wait_for(engine.get_result(req_id), timeout=1.0)
+        assert output.error == "decode failed"
+        assert engine.scheduler.get_request_state(req_id) is None
+        assert req_id not in engine._out_queue
+
     def test_initializes_step_scheduler_when_step_execution_enabled(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -515,6 +583,35 @@ class TestStepScheduler:
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
+
+    def test_decoding_releases_dit_slot_for_next_request(self) -> None:
+        req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=1))
+        req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=1))
+
+        first = self.scheduler.schedule()
+        assert first.scheduled_req_ids == [req_id_a]
+        finished = self.scheduler.update_from_output(
+            first,
+            RunnerOutput(
+                req_id=req_id_a,
+                step_index=1,
+                finished=False,
+                denoise_completed=True,
+            ),
+        )
+
+        assert finished == set()
+        assert DiffusionRequestStatus.is_finished(DiffusionRequestStatus.DECODING) is False
+        assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.DECODING
+        assert self.scheduler.get_decoding_req_ids() == {req_id_a}
+
+        # A is still decoding, but B can immediately occupy the free DiT slot.
+        second = self.scheduler.schedule()
+        assert second.scheduled_req_ids == [req_id_b]
+
+        self.scheduler.finish_requests(req_id_a, DiffusionRequestStatus.FINISHED_COMPLETED)
+        assert self.scheduler.get_decoding_req_ids() == set()
+        assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))

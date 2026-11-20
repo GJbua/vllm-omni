@@ -19,6 +19,7 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.diffusion.worker.vae_worker import VAEDecodeResult, VAEWorkerProc
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -39,10 +40,13 @@ class BackgroundResources:
     result_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    wake_events: list[mp.Event] | None = None
+    vae_task_queue: mp.Queue | None = None
+    vae_result_queue: mp.Queue | None = None
 
     def __call__(self):
         """Clean up background resources."""
-        if hasattr(self, "wake_events") and self.wake_events:
+        if self.wake_events:
             for ev in self.wake_events:
                 ev.set()
 
@@ -56,6 +60,12 @@ class BackgroundResources:
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
 
+        if self.vae_task_queue is not None:
+            try:
+                self.vae_task_queue.put(None)
+            except Exception as exc:
+                logger.warning("Failed to send VAE shutdown sentinel: %s", exc)
+
         if self.processes:
             for proc in self.processes:
                 if not proc.is_alive():
@@ -66,36 +76,140 @@ class BackgroundResources:
                     proc.terminate()
                     proc.join(30)
 
+        for q in (self.vae_task_queue, self.vae_result_queue):
+            if q is not None:
+                try:
+                    q.close()
+                    q.join_thread()
+                except Exception as exc:
+                    logger.warning("Failed to close VAE multiprocessing queue: %s", exc)
+
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
 
     def _init_executor(self) -> None:
+        mp.set_start_method("spawn", force=True)
         self._processes: list[mp.Process] = []
         self._closed = False
         self.is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
 
+        self._vae_task_queue = None
+        self._vae_result_queue = None
+        self._vae_process = None
         num_workers = self.od_config.num_gpus
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events: list[mp.Event] = []
+        self._broadcast_mq = None
+        self._result_mq = None
 
-        self._broadcast_mq = self._init_broadcast_queue(num_workers)
-        broadcast_handle = self._broadcast_mq.export_handle()
+        try:
+            if getattr(self.od_config, "enable_vae_disaggregation", False) is True:
+                self._validate_vae_disaggregation_config()
+                self._vae_task_queue = mp.Queue()
+                self._vae_result_queue = mp.Queue()
+                self._vae_process = self._launch_vae_worker()
 
-        # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
-        self._result_mq = self._init_result_queue(result_handle)
-        self._processes = processes
+            self.wake_events = [mp.Event() for _ in range(num_workers)]
+            self._broadcast_mq = self._init_broadcast_queue(num_workers)
+            broadcast_handle = self._broadcast_mq.export_handle()
+
+            processes, result_handle = self._launch_workers(
+                broadcast_handle,
+                self.wake_events,
+                self._vae_task_queue,
+            )
+            self._processes = [*processes, *([self._vae_process] if self._vae_process is not None else [])]
+            self._result_mq = self._init_result_queue(result_handle)
+        except Exception:
+            cleanup_processes = list(self._processes)
+            if not cleanup_processes and self._vae_process is not None:
+                cleanup_processes.append(self._vae_process)
+            BackgroundResources(
+                broadcast_mq=self._broadcast_mq,
+                result_mq=self._result_mq,
+                num_workers=num_workers,
+                processes=cleanup_processes,
+                wake_events=self.wake_events,
+                vae_task_queue=self._vae_task_queue,
+                vae_result_queue=self._vae_result_queue,
+            )()
+            raise
 
         self.resources = BackgroundResources(
             broadcast_mq=self._broadcast_mq,
             result_mq=self._result_mq,
             num_workers=num_workers,
             processes=self._processes,
+            wake_events=self.wake_events,
+            vae_task_queue=self._vae_task_queue,
+            vae_result_queue=self._vae_result_queue,
         )
         self._finalizer = weakref.finalize(self, self.resources)
 
         self.start_worker_monitor()
+
+    def _validate_vae_disaggregation_config(self) -> None:
+        if not getattr(self.od_config, "step_execution", False):
+            raise ValueError("enable_vae_disaggregation=True requires step_execution=True.")
+        if self.od_config.model_class_name != "QwenImagePipeline":
+            raise ValueError(
+                "VAE disaggregation MVP currently supports only QwenImagePipeline, "
+                f"got {self.od_config.model_class_name!r}."
+            )
+        parallel_config = self.od_config.parallel_config
+        if parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "VAE disaggregation MVP currently requires data_parallel_size=1; "
+                "one VAE worker per DP replica is not implemented yet."
+            )
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("VAE disaggregation MVP currently requires pipeline_parallel_size=1.")
+        if parallel_config.vae_patch_parallel_size != 1:
+            raise ValueError("Standalone VAE worker requires vae_patch_parallel_size=1.")
+
+    def _launch_vae_worker(self) -> mp.Process:
+        ready_reader, ready_writer = mp.Pipe(duplex=False)
+        process = mp.Process(
+            target=VAEWorkerProc.worker_main,
+            args=(
+                self.od_config,
+                self._vae_task_queue,
+                self._vae_result_queue,
+                ready_writer,
+            ),
+            name="VAEWorker-0",
+            daemon=True,
+        )
+        try:
+            process.start()
+        except Exception:
+            ready_reader.close()
+            ready_writer.close()
+            raise
+        ready_writer.close()
+        if not ready_reader.poll(300):
+            process.terminate()
+            process.join(30)
+            raise TimeoutError("VAE worker initialization timed out after 300 seconds.")
+        try:
+            ready = ready_reader.recv()
+        except EOFError as exc:
+            process.join(30)
+            if process.is_alive():
+                process.terminate()
+                process.join(30)
+            raise RuntimeError("VAE worker exited before reporting ready.") from exc
+        finally:
+            ready_reader.close()
+        if ready.get("status") != "ready":
+            process.join(30)
+            if process.is_alive():
+                process.terminate()
+                process.join(30)
+            raise RuntimeError(f"VAE worker initialization failed: {ready.get('error', 'unknown error')}")
+        logger.info("Standalone VAE worker is ready on device %s", self.od_config.vae_device)
+        return process
 
     def _init_broadcast_queue(self, num_workers: int) -> MessageQueue:
         return MessageQueue(
@@ -133,12 +247,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     raise EngineDeadError()
                 continue
 
-    def _launch_workers(self, broadcast_handle, wake_events):
+    def _launch_workers(self, broadcast_handle, wake_events, vae_task_queue=None):
         od_config = self.od_config
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -162,12 +275,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
+                    vae_task_queue if i == 0 else None,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )
             scheduler_pipe_readers.append(reader)
-            process.start()
+            try:
+                process.start()
+            except Exception:
+                for started_process in processes:
+                    if started_process.is_alive():
+                        started_process.terminate()
+                    started_process.join(30)
+                for pipe in (*scheduler_pipe_readers, *scheduler_pipe_writers):
+                    pipe.close()
+                raise
             processes.append(process)
 
         # Wait for all workers to be ready
@@ -176,23 +299,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for writer in scheduler_pipe_writers:
             writer.close()
 
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
-                processes[i].join()
-                logger.error(f"Exit code: {processes[i].exitcode}")
-                raise
+        try:
+            for i, reader in enumerate(scheduler_pipe_readers):
+                try:
+                    data = reader.recv()
+                except EOFError:
+                    logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
+                    processes[i].join(30)
+                    logger.error(f"Exit code: {processes[i].exitcode}")
+                    raise
 
-            if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
+                if data["status"] != "ready":
+                    raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
-                result_handle = data.get("result_handle")
+                if i == 0:
+                    result_handle = data.get("result_handle")
 
-            scheduler_infos.append(data)
-            reader.close()
+                scheduler_infos.append(data)
+        except Exception:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(30)
+            raise
+        finally:
+            for reader in scheduler_pipe_readers:
+                reader.close()
 
         logger.debug("All workers are ready")
 
@@ -222,6 +354,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     dead,
                 )
                 self.is_failed = True
+                vae_result_queue = getattr(self, "_vae_result_queue", None)
+                if vae_result_queue is not None:
+                    vae_result_queue.put(None)
 
             self.shutdown()
 
@@ -393,6 +528,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self.is_failed = True
                 raise EngineDeadError(f"Worker process {p.name} is dead")
 
+    @property
+    def vae_disaggregation_enabled(self) -> bool:
+        return getattr(self, "_vae_result_queue", None) is not None
+
+    def get_vae_result(self, timeout: float | None = None) -> VAEDecodeResult | None:
+        if self._vae_result_queue is None:
+            raise RuntimeError("VAE result queue is not initialized.")
+        result = self._vae_result_queue.get(timeout=timeout)
+        if result is None:
+            return None
+        if not isinstance(result, VAEDecodeResult):
+            raise RuntimeError(f"Unexpected VAE result type: {type(result)!r}")
+        if result.result is not None:
+            unpack_diffusion_output_shm(result.result)
+        return result
+
     def shutdown(self) -> None:
         self._closed = True
         try:
@@ -400,5 +551,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         finally:
             self._broadcast_mq = None
             self._result_mq = None
+            self._vae_task_queue = None
+            self._vae_result_queue = None
+            self._vae_process = None
             self.resources = None
             self._processes = []
